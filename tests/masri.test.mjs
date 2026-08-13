@@ -22,6 +22,28 @@ test("voice loop includes record, transcription, evaluation and speech", async (
   assert.match(app, /speechSynthesis/);
 });
 
+test("Mistral TTS resolves a preset voice and returns validated MP3 bytes", async () => {
+  const route = await readFile(new URL("app/api/speech/route.ts", root), "utf8");
+  assert.match(route, /audio\/voices\?type=preset/);
+  assert.match(route, /voice_id: resolvedVoice/);
+  assert.match(route, /voxtral-mini-tts-2603/);
+  assert.match(route, /audio_data/);
+  assert.match(route, /Content-Type": "audio\/mpeg"/);
+  assert.match(route, /bytes\.byteLength < 128/);
+});
+
+test("speaking state follows successful playback and exposes diagnostics", async () => {
+  const app = await readFile(new URL("app/components/MasriApp.tsx", root), "utf8");
+  const playIndex = app.indexOf("await audio.play()");
+  const speakingIndex = app.indexOf('setVoiceState("speaking")', playIndex);
+  assert.ok(playIndex >= 0 && speakingIndex > playIndex);
+  for (const event of ["TTS REQUEST STARTED", "HTTP STATUS", "AUDIO RECEIVED", "AUDIO BYTE SIZE", "PLAYBACK STARTED", "PLAYBACK ENDED", "PLAYBACK ERROR"]) {
+    assert.match(app, new RegExp(event));
+  }
+  assert.match(app, /URL\.createObjectURL\(blob\)/);
+  assert.match(app, /audioUnlockedRef/);
+});
+
 test("local learning memory supports saved items and spaced review", async () => {
   const storage = await readFile(new URL("app/lib/storage.ts", root), "utf8");
   assert.match(storage, /class MasriDatabase extends Dexie/);

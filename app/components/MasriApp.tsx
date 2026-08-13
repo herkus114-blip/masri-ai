@@ -15,6 +15,12 @@ type Tab = "conversation" | "dictionary" | "practice" | "situations" | "progress
 type VoiceState = "ready" | "listening" | "thinking" | "speaking";
 type Provider = "mistral" | "openai" | "custom";
 
+interface TtsDiagnostic {
+  label: "TTS REQUEST STARTED" | "HTTP STATUS" | "AUDIO RECEIVED" | "AUDIO BYTE SIZE" | "PLAYBACK STARTED" | "PLAYBACK ENDED" | "PLAYBACK ERROR";
+  detail?: string;
+  error?: boolean;
+}
+
 interface ProviderConfig {
   provider: Provider;
   apiKey: string;
@@ -45,8 +51,8 @@ const navItems = [
 ];
 
 const starterPrompt = {
-  arabic: "عامل إيه؟ عملت إيه النهارده؟",
-  english: "How are you? What did you do today?",
+  arabic: "عامل إيه؟",
+  english: "How are you?",
 };
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
@@ -96,6 +102,8 @@ export default function MasriApp() {
   const [connectionState, setConnectionState] = useState<"idle" | "testing" | "success" | "error">("idle");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [micLevel, setMicLevel] = useState(0.25);
+  const [audioUnlocked, setAudioUnlocked] = useState(false);
+  const [ttsDiagnostics, setTtsDiagnostics] = useState<TtsDiagnostic[]>([]);
 
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
@@ -103,7 +111,9 @@ export default function MasriApp() {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const recognitionRef = useRef<{ stop: () => void } | null>(null);
   const speechTextRef = useRef("");
-  const initialPromptSpoken = useRef(false);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioUnlockedRef = useRef(false);
+  const audioUrlRef = useRef<string | null>(null);
   const historyRef = useRef(history);
   const [reviewClock] = useState(() => Date.now());
 
@@ -148,49 +158,114 @@ export default function MasriApp() {
     }
   };
 
-  const browserSpeak = useCallback((text: string) => new Promise<void>((resolve) => {
-    if (!("speechSynthesis" in window)) { resolve(); return; }
+  const reportTts = useCallback((entry: TtsDiagnostic) => {
+    setTtsDiagnostics((current) => [...current, entry].slice(-7));
+    const message = `[MASRI TTS] ${entry.label}${entry.detail ? ` — ${entry.detail}` : ""}`;
+    if (entry.error) console.error(message);
+    else console.info(message);
+  }, []);
+
+  const unlockAudio = useCallback(async () => {
+    if (audioUnlockedRef.current) return true;
+    const audio = audioRef.current;
+    if (!audio) return false;
+    try {
+      const silentWav = "data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQQAAACAgICA";
+      audio.src = silentWav;
+      audio.volume = 0.01;
+      await audio.play();
+      audio.pause();
+      audio.removeAttribute("src");
+      audio.load();
+      audio.volume = 1;
+      audioUnlockedRef.current = true;
+      setAudioUnlocked(true);
+      return true;
+    } catch (cause) {
+      reportTts({ label: "PLAYBACK ERROR", detail: cause instanceof Error ? cause.message : "Browser audio unlock failed.", error: true });
+      return false;
+    }
+  }, [reportTts]);
+
+  const browserSpeak = useCallback((text: string) => new Promise<void>((resolve, reject) => {
+    if (!("speechSynthesis" in window)) { reject(new Error("Browser speech synthesis is unavailable.")); return; }
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = "ar-EG";
     utterance.rate = config.speed;
     const voice = window.speechSynthesis.getVoices().find((item) => item.lang.toLowerCase().startsWith("ar"));
     if (voice) utterance.voice = voice;
-    utterance.onend = () => resolve();
-    utterance.onerror = () => resolve();
+    utterance.onstart = () => { setVoiceState("speaking"); reportTts({ label: "PLAYBACK STARTED", detail: "browser Arabic voice" }); };
+    utterance.onend = () => { reportTts({ label: "PLAYBACK ENDED" }); resolve(); };
+    utterance.onerror = (event) => reject(new Error(`Browser speech failed: ${event.error}`));
     window.speechSynthesis.speak(utterance);
-  }), [config.speed]);
+  }), [config.speed, reportTts]);
 
   const speak = useCallback(async (text: string) => {
-    setVoiceState("speaking");
+    setError("");
+    setTtsDiagnostics([]);
+    setVoiceState("thinking");
+    setThinkingStatus("GENERATING VOICE");
+    reportTts({ label: "TTS REQUEST STARTED", detail: text });
     try {
-      if (config.apiKey) {
-        const data = await postJson<{ audio: string; type: string }>("/api/speech", {
+      if (!audioUnlockedRef.current) throw new Error("Tap the Voice Core or speaker once to enable audio.");
+      if (!config.apiKey) {
+        await browserSpeak(text);
+        return;
+      }
+
+      const response = await fetch("/api/speech", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
           text, provider: config.provider, apiKey: config.apiKey, model: config.ttsModel,
           voice: config.voiceId, baseUrl: config.baseUrl,
-        });
-        const audio = new Audio(`data:${data.type};base64,${data.audio}`);
-        audio.playbackRate = config.speed;
-        await audio.play();
-        await new Promise<void>((resolve) => { audio.onended = () => resolve(); audio.onerror = () => resolve(); });
-      } else {
-        await browserSpeak(text);
+        }),
+      });
+      reportTts({ label: "HTTP STATUS", detail: String(response.status), error: !response.ok });
+      if (!response.ok) {
+        const problem = await response.json().catch(() => ({ error: "TTS request failed." })) as { error?: string };
+        throw new Error(problem.error || `TTS request failed with HTTP ${response.status}.`);
       }
-    } catch {
-      await browserSpeak(text);
+
+      const mimeType = response.headers.get("content-type") || "";
+      const blob = await response.blob();
+      reportTts({ label: "AUDIO RECEIVED", detail: mimeType || "unknown MIME type" });
+      reportTts({ label: "AUDIO BYTE SIZE", detail: String(blob.size), error: blob.size < 128 });
+      if (!mimeType.startsWith("audio/") || blob.size < 128) {
+        throw new Error(`Invalid TTS audio response (${mimeType || "no MIME type"}, ${blob.size} bytes).`);
+      }
+
+      const audio = audioRef.current;
+      if (!audio) throw new Error("The browser audio element is unavailable.");
+      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+      const objectUrl = URL.createObjectURL(blob);
+      audioUrlRef.current = objectUrl;
+      audio.src = objectUrl;
+      audio.playbackRate = config.speed;
+      audio.volume = 1;
+      audio.load();
+
+      const ended = new Promise<void>((resolve, reject) => {
+        audio.onended = () => { reportTts({ label: "PLAYBACK ENDED" }); resolve(); };
+        audio.onerror = () => reject(new Error(audio.error?.message || `Audio element error code ${audio.error?.code ?? "unknown"}.`));
+      });
+      await audio.play();
+      setVoiceState("speaking");
+      reportTts({ label: "PLAYBACK STARTED", detail: `${mimeType}, ${blob.size} bytes` });
+      await ended;
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : "Audio playback failed.";
+      reportTts({ label: "PLAYBACK ERROR", detail: message, error: true });
+      setError(message);
     } finally {
       setVoiceState("ready");
     }
-  }, [browserSpeak, config]);
+  }, [browserSpeak, config, reportTts]);
 
-  useEffect(() => {
-    if (initialPromptSpoken.current) return;
-    const timer = window.setTimeout(() => {
-      initialPromptSpoken.current = true;
-      void speak(starterPrompt.arabic);
-    }, 650);
-    return () => window.clearTimeout(timer);
-  }, [speak]);
+  const enableVoiceAndSpeak = useCallback(async (text: string) => {
+    if (await unlockAudio()) await speak(text);
+  }, [speak, unlockAudio]);
 
   const aiPayload = useCallback((task: "conversation" | "dictionary" | "teach" | "test", text: string) => ({
     task, config: { provider: config.provider, apiKey: config.apiKey, baseUrl: config.baseUrl, textModel: config.textModel },
@@ -257,6 +332,7 @@ export default function MasriApp() {
   const startRecording = async () => {
     setError(""); speechTextRef.current = ""; chunks.current = []; setRecordingSeconds(0);
     try {
+      if (!(await unlockAudio())) throw new Error("Browser audio could not be enabled.");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
       streamRef.current = stream;
       const recorder = new MediaRecorder(stream, MediaRecorder.isTypeSupported("audio/webm") ? { mimeType: "audio/webm" } : undefined);
@@ -284,8 +360,12 @@ export default function MasriApp() {
     }
   };
 
-  const submitTyped = (event: FormEvent) => {
-    event.preventDefault(); const value = typed; setTyped(""); void processTurn(value);
+  const submitTyped = async (event: FormEvent) => {
+    event.preventDefault();
+    const value = typed;
+    setTyped("");
+    await unlockAudio();
+    await processTurn(value);
   };
 
   const searchDictionary = async (event?: FormEvent) => {
@@ -342,18 +422,18 @@ export default function MasriApp() {
       <Panel className="voice-stage">
         <div className="stage-grid" aria-hidden="true" />
         <div className="live-context"><span className="pulse-dot" /> LIVE CONTEXT <span>{customTopic || mode.toUpperCase()}</span></div>
-        <button className={`voice-core ${voiceState}`} onClick={voiceState === "listening" ? stopRecording : voiceState === "ready" ? startRecording : undefined} aria-label={voiceState === "listening" ? "Stop recording" : "Start speaking"} style={{ "--mic-level": micLevel } as React.CSSProperties}>
+        <button className={`voice-core ${voiceState}`} onClick={voiceState === "listening" ? stopRecording : voiceState === "ready" ? audioUnlocked ? startRecording : () => void enableVoiceAndSpeak(prompt.arabic) : undefined} aria-label={voiceState === "listening" ? "Stop recording" : audioUnlocked ? "Start speaking" : "Enable voice and hear MASRI"} style={{ "--mic-level": micLevel } as React.CSSProperties}>
           <span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="core-halo" />
           <span className="core-inner">
             {voiceState === "listening" ? <MicOff size={30} /> : voiceState === "thinking" ? <Activity size={30} /> : voiceState === "speaking" ? <Volume2 size={30} /> : <Mic size={30} />}
-            <strong>{voiceState === "ready" ? "MASRI READY" : voiceState.toUpperCase()}</strong>
-            <small>{voiceState === "ready" ? "TAP TO SPEAK" : voiceState === "listening" ? `${recordingSeconds}s · TAP TO STOP` : voiceState === "thinking" ? thinkingStatus : "VOICE ACTIVE"}</small>
+            <strong>{voiceState === "ready" ? audioUnlocked ? "MASRI READY" : "MASRI VOICE" : voiceState.toUpperCase()}</strong>
+            <small>{voiceState === "ready" ? audioUnlocked ? "TAP TO SPEAK" : "TAP TO ENABLE & HEAR" : voiceState === "listening" ? `${recordingSeconds}s · TAP TO STOP` : voiceState === "thinking" ? thinkingStatus : "VOICE ACTIVE"}</small>
           </span>
         </button>
         <div className={`wave-strip ${voiceState}`} aria-hidden="true">{Array.from({ length: 21 }, (_, i) => <i key={i} style={{ animationDelay: `${i * -0.06}s` }} />)}</div>
         <div className="prompt-block">
           <ArabicText className="prompt-arabic">{prompt.arabic}</ArabicText>
-          <button className="icon-button small" onClick={() => void speak(prompt.arabic)} aria-label="Play MASRI prompt"><Volume2 size={17} /></button>
+          <button className="icon-button small" onClick={() => void enableVoiceAndSpeak(prompt.arabic)} aria-label="Play MASRI prompt"><Volume2 size={17} /></button>
           <p>{prompt.english}</p>
         </div>
         <div className="conversation-actions">
@@ -364,6 +444,7 @@ export default function MasriApp() {
           <Keyboard size={17} /><input value={typed} onChange={(event) => setTyped(event.target.value)} placeholder="Type your answer in Arabic…" aria-label="Type your answer" dir="rtl" />
           <button disabled={!typed.trim()} aria-label="Send typed answer"><Send size={17} /></button>
         </form>
+        {ttsDiagnostics.length > 0 && <div className="tts-diagnostics" aria-live="polite"><span>TTS DIAGNOSTICS</span>{ttsDiagnostics.map((item, index) => <div className={item.error ? "error" : ""} key={`${item.label}-${index}`}><b>{item.label}</b>{item.detail && <small>{item.detail}</small>}</div>)}</div>}
       </Panel>
     </div>
     <aside className="coach-column">
@@ -409,6 +490,7 @@ export default function MasriApp() {
     { title: "Airport", arabic: "البوابة فين؟", icon: Plane, level: "HIGH" },
   ];
 
+  // eslint-disable-next-line react-hooks/refs -- voice playback runs only from the click handler.
   const renderSituations = () => <div className="content-wide"><div className="page-heading"><div><span className="section-kicker">ROLEPLAY</span><h1>Rehearse life before it happens.</h1><p>MASRI plays the other person. You respond out loud in Egyptian.</p></div></div><div className="situation-grid">{situations.map(({ title, arabic, icon: Icon, level }) => <button key={title} className="situation-card" onClick={() => { setPrompt({ arabic, english: title }); setMode(title); setTab("conversation"); window.setTimeout(() => void speak(arabic), 100); }}><span className="situation-icon"><Icon size={22} /></span><span className={`priority ${level.toLowerCase()}`}>{level}</span><strong>{title}</strong><ArabicText>{arabic}</ArabicText><span className="begin">BEGIN ROLEPLAY <ChevronRight size={16} /></span></button>)}</div></div>;
 
   const renderProgress = () => <div className="content-wide">
@@ -426,8 +508,10 @@ export default function MasriApp() {
     <nav className="side-nav" aria-label="Main navigation">{navItems.map(({ id, label, icon: Icon }) => <button className={tab === id ? "active" : ""} key={id} onClick={() => setTab(id)}><Icon size={20} /><span>{label}</span></button>)}</nav>
     <div className="app-content">{error && <div className="error-banner"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}{tab === "conversation" && renderConversation()}{tab === "dictionary" && renderDictionary()}{tab === "practice" && renderPractice()}{tab === "situations" && renderSituations()}{tab === "progress" && renderProgress()}</div>
     <nav className="bottom-nav" aria-label="Mobile navigation">{navItems.map(({ id, label, icon: Icon }) => <button className={tab === id ? "active" : ""} key={id} onClick={() => setTab(id)}><Icon size={20} /><span>{label}</span></button>)}</nav>
-    {showDontKnow && <div className="modal-backdrop"><div className="modal small-modal"><button className="modal-close" onClick={() => setShowDontKnow(false)}><X size={19} /></button><span className="section-kicker">I DON&apos;T KNOW</span><h2>What did you want to say?</h2><p>Type it in English. MASRI will teach one natural Egyptian phrase and ask you to say it.</p><form onSubmit={(event) => { event.preventDefault(); setShowDontKnow(false); void processTurn(dontKnowText, "teach"); setDontKnowText(""); }}><textarea value={dontKnowText} onChange={(event) => setDontKnowText(event.target.value)} placeholder="I need to finish something first." aria-label="English phrase to learn" /><button className="primary-button" disabled={!dontKnowText.trim()}>TEACH ME <ArrowLeft size={16} /></button></form></div></div>}
+    {showDontKnow && <div className="modal-backdrop"><div className="modal small-modal"><button className="modal-close" onClick={() => setShowDontKnow(false)}><X size={19} /></button><span className="section-kicker">I DON&apos;T KNOW</span><h2>What did you want to say?</h2><p>Type it in English. MASRI will teach one natural Egyptian phrase and ask you to say it.</p><form onSubmit={async (event) => { event.preventDefault(); setShowDontKnow(false); await unlockAudio(); await processTurn(dontKnowText, "teach"); setDontKnowText(""); }}><textarea value={dontKnowText} onChange={(event) => setDontKnowText(event.target.value)} placeholder="I need to finish something first." aria-label="English phrase to learn" /><button className="primary-button" disabled={!dontKnowText.trim()}>TEACH ME <ArrowLeft size={16} /></button></form></div></div>}
     {settingsOpen && <SettingsModal config={config} setConfig={persistConfig} close={() => setSettingsOpen(false)} connectionState={connectionState} testConnection={testConnection} clearData={async () => { if (window.confirm("Clear all learning data on this device?")) { await db().delete(); await refreshLearning(); showToast("Learning data cleared"); } }} />}
+    {/* eslint-disable-next-line jsx-a11y/media-has-caption -- spoken text is rendered beside its playback control. */}
+    <audio ref={audioRef} preload="auto" aria-hidden="true" />
     {toast && <div className="toast"><Check size={16} />{toast}</div>}
   </main>;
 }
@@ -458,7 +542,7 @@ function SettingsModal({ config, setConfig, close, connectionState, testConnecti
       <label className="toggle-line" aria-label="Remember on this device"><span><strong>Remember on this device</strong><small>Off stores the key for this browser session only.</small></span><input aria-label="Remember on this device" type="checkbox" checked={config.remember} onChange={(e) => patch({ remember: e.target.checked })} /></label>
       <button className={`test-button ${connectionState}`} onClick={testConnection} disabled={connectionState === "testing"}>{connectionState === "testing" ? "TESTING…" : connectionState === "success" ? "CONNECTED" : connectionState === "error" ? "CONNECTION FAILED" : "TEST CONNECTION"}</button>
     </div>
-    <div className="settings-section models"><h3>MODELS & VOICE</h3><label>TEXT MODEL<input value={config.textModel} onChange={(e) => patch({ textModel: e.target.value })} /></label><label>SPEECH-TO-TEXT<input value={config.sttModel} onChange={(e) => patch({ sttModel: e.target.value })} /></label><label>TEXT-TO-SPEECH<input value={config.ttsModel} onChange={(e) => patch({ ttsModel: e.target.value })} /></label><label>VOICE ID <small>(optional)</small><input value={config.voiceId} onChange={(e) => patch({ voiceId: e.target.value })} placeholder="Uses browser Arabic voice when blank/unavailable" /></label><label>VOICE SPEED<select value={config.speed} onChange={(e) => patch({ speed: Number(e.target.value) })}><option value={0.8}>0.8×</option><option value={1}>1×</option><option value={1.15}>1.15×</option></select></label></div>
+    <div className="settings-section models"><h3>MODELS & VOICE</h3><label>TEXT MODEL<input value={config.textModel} onChange={(e) => patch({ textModel: e.target.value })} /></label><label>SPEECH-TO-TEXT<input value={config.sttModel} onChange={(e) => patch({ sttModel: e.target.value })} /></label><label>TEXT-TO-SPEECH<input value={config.ttsModel} onChange={(e) => patch({ ttsModel: e.target.value })} /></label><label>VOICE ID <small>(optional)</small><input value={config.voiceId} onChange={(e) => patch({ voiceId: e.target.value })} placeholder="Auto-selects an Arabic preset when blank" /></label><label>VOICE SPEED<select value={config.speed} onChange={(e) => patch({ speed: Number(e.target.value) })}><option value={0.8}>0.8×</option><option value={1}>1×</option><option value={1.15}>1.15×</option></select></label></div>
     <div className="settings-section"><h3>PRIVACY & COST</h3><label className="toggle-line" aria-label="Cost saver mode"><span><strong>Cost saver mode</strong><small>One combined evaluation + response call per turn.</small></span><input aria-label="Cost saver mode" type="checkbox" checked={config.costSaver} onChange={(e) => patch({ costSaver: e.target.checked })} /></label><label className="toggle-line" aria-label="Allow web search"><span><strong>Allow web search</strong><small>Off. Ordinary language coaching never needs it.</small></span><input aria-label="Allow web search" type="checkbox" checked={config.webSearch} onChange={(e) => patch({ webSearch: e.target.checked })} /></label><label className="toggle-line" aria-label="Save recordings locally"><span><strong>Save recordings locally</strong><small>Off. Audio is discarded after transcription.</small></span><input aria-label="Save recordings locally" type="checkbox" checked={config.saveRecordings} onChange={(e) => patch({ saveRecordings: e.target.checked })} /></label><button className="danger-button" onClick={clearData}><Trash2 size={15} /> CLEAR LEARNING DATA</button></div>
   </div></div>;
 }
