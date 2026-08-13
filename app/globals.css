@@ -13,6 +13,7 @@
   --muted: #85999a;
   --danger: #e78b7d;
 }
+.settings-error { color: var(--danger) !important; margin: 9px 0 0; font-size: 10px !important; }
 
 * { box-sizing: border-box; }
 html { background: var(--bg); color-scheme: dark; }

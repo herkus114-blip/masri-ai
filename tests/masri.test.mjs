@@ -52,6 +52,24 @@ test("local learning memory supports saved items and spaced review", async () =>
   assert.match(storage, /exportLearningData/);
 });
 
+test("conversation focus words feed real recent memory", async () => {
+  const app = await readFile(new URL("app/components/MasriApp.tsx", root), "utf8");
+  const storage = await readFile(new URL("app/lib/storage.ts", root), "utf8");
+  assert.match(app, /rememberFocusWords\(turn\.focusWords\)/);
+  assert.match(app, /saved\.slice\(0, 8\)/);
+  assert.match(storage, /focusWord\.priority !== "CORE" && focusWord\.priority !== "HIGH"/);
+  assert.doesNotMatch(storage, /seedLearningData/);
+});
+
+test("voice output provider is independent and includes ElevenLabs", async () => {
+  const app = await readFile(new URL("app/components/MasriApp.tsx", root), "utf8");
+  assert.match(app, /type TtsProvider = "mistral" \| "elevenlabs" \| "browser"/);
+  assert.match(app, /provider: config\.ttsProvider/);
+  assert.match(app, /eleven_multilingual_v2/);
+  assert.match(app, /eleven_flash_v2_5/);
+  assert.match(app, /عامل إيه؟ عملت إيه النهارده؟/);
+});
+
 test("API keys are never hardcoded", async () => {
   const config = await readFile(new URL("app/components/MasriApp.tsx", root), "utf8");
   const env = await readFile(new URL(".env.example", root), "utf8");

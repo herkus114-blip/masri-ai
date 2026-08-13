@@ -9,11 +9,12 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DictionaryResultSchema, TutorTurnSchema, type DictionaryResult, type TutorTurn } from "../lib/schemas";
 import { demoDictionary, demoTeach, demoTutorTurn } from "../lib/demo";
-import { db, exportLearningData, recordTurn, reviewItem, saveItem, seedLearningData, type SavedItem } from "../lib/storage";
+import { db, exportLearningData, recordTurn, rememberFocusWords, reviewItem, saveItem, sortSavedByRecent, type SavedItem } from "../lib/storage";
 
 type Tab = "conversation" | "dictionary" | "practice" | "situations" | "progress";
 type VoiceState = "ready" | "listening" | "thinking" | "speaking";
 type Provider = "mistral" | "openai" | "custom";
+type TtsProvider = "mistral" | "elevenlabs" | "browser";
 
 interface TtsDiagnostic {
   label: "TTS REQUEST STARTED" | "HTTP STATUS" | "AUDIO RECEIVED" | "AUDIO BYTE SIZE" | "PLAYBACK STARTED" | "PLAYBACK ENDED" | "PLAYBACK ERROR";
@@ -27,8 +28,12 @@ interface ProviderConfig {
   baseUrl: string;
   textModel: string;
   sttModel: string;
-  ttsModel: string;
-  voiceId: string;
+  ttsProvider: TtsProvider;
+  mistralTtsModel: string;
+  mistralVoiceId: string;
+  elevenLabsApiKey: string;
+  elevenLabsVoiceId: string;
+  elevenLabsModel: "eleven_multilingual_v2" | "eleven_flash_v2_5";
   speed: number;
   remember: boolean;
   costSaver: boolean;
@@ -38,7 +43,8 @@ interface ProviderConfig {
 
 const defaultConfig: ProviderConfig = {
   provider: "mistral", apiKey: "", baseUrl: "", textModel: "mistral-small-latest",
-  sttModel: "voxtral-mini-latest", ttsModel: "voxtral-mini-tts-2603", voiceId: "",
+  sttModel: "voxtral-mini-latest", ttsProvider: "mistral", mistralTtsModel: "voxtral-mini-tts-2603", mistralVoiceId: "",
+  elevenLabsApiKey: "", elevenLabsVoiceId: "", elevenLabsModel: "eleven_multilingual_v2",
   speed: 1, remember: false, costSaver: true, webSearch: false, saveRecordings: false,
 };
 
@@ -123,8 +129,7 @@ export default function MasriApp() {
   }, []);
 
   const refreshLearning = useCallback(async () => {
-    await seedLearningData();
-    setSaved(await db().saved.toArray());
+    setSaved(sortSavedByRecent(await db().saved.toArray()));
     setConversations(await db().conversations.orderBy("createdAt").reverse().toArray());
     setMinutesSpoken((await db().metrics.get("minutesSpoken"))?.value ?? 0);
   }, []);
@@ -135,7 +140,13 @@ export default function MasriApp() {
     const stored = local || session;
     if (stored) {
       try {
-        const next = { ...defaultConfig, ...JSON.parse(stored) };
+        const previous = JSON.parse(stored) as Partial<ProviderConfig> & { ttsModel?: string; voiceId?: string };
+        const next: ProviderConfig = {
+          ...defaultConfig,
+          ...previous,
+          mistralTtsModel: previous.mistralTtsModel || previous.ttsModel || defaultConfig.mistralTtsModel,
+          mistralVoiceId: previous.mistralVoiceId ?? previous.voiceId ?? "",
+        };
         queueMicrotask(() => setConfig(next));
       } catch { /* ignore corrupted preference */ }
     }
@@ -209,17 +220,23 @@ export default function MasriApp() {
     reportTts({ label: "TTS REQUEST STARTED", detail: text });
     try {
       if (!audioUnlockedRef.current) throw new Error("Tap the Voice Core or speaker once to enable audio.");
-      if (!config.apiKey) {
+      if (config.ttsProvider === "browser" || (config.ttsProvider === "mistral" && !config.apiKey)) {
         await browserSpeak(text);
         return;
       }
+
+      const isElevenLabs = config.ttsProvider === "elevenlabs";
+      const apiKey = isElevenLabs ? config.elevenLabsApiKey : config.apiKey;
+      const voice = isElevenLabs ? config.elevenLabsVoiceId : config.mistralVoiceId;
+      const model = isElevenLabs ? config.elevenLabsModel : config.mistralTtsModel;
+      if (!apiKey) throw new Error(`${isElevenLabs ? "ElevenLabs" : "Mistral"} API key is missing.`);
+      if (isElevenLabs && !voice.trim()) throw new Error("ElevenLabs Voice ID is missing.");
 
       const response = await fetch("/api/speech", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text, provider: config.provider, apiKey: config.apiKey, model: config.ttsModel,
-          voice: config.voiceId, baseUrl: config.baseUrl,
+          text, provider: config.ttsProvider, apiKey, model, voice,
         }),
       });
       reportTts({ label: "HTTP STATUS", detail: String(response.status), error: !response.ok });
@@ -270,7 +287,7 @@ export default function MasriApp() {
   const aiPayload = useCallback((task: "conversation" | "dictionary" | "teach" | "test", text: string) => ({
     task, config: { provider: config.provider, apiKey: config.apiKey, baseUrl: config.baseUrl, textModel: config.textModel },
     text, mode: customTopic || mode, history: historyRef.current.slice(-10),
-    recentWords: saved.slice(-8).map((item) => item.arabic),
+    recentWords: saved.slice(0, 8).map((item) => item.arabic),
     recurringMistakes: conversations.map((item) => item.mistakeTag).filter(Boolean).slice(0, 6),
   }), [config, conversations, customTopic, mode, saved]);
 
@@ -292,7 +309,9 @@ export default function MasriApp() {
       const nextHistory = [...historyRef.current, { role: "user" as const, content: turn.transcript }, { role: "assistant" as const, content: turn.replyArabic }].slice(-12);
       setHistory(nextHistory);
       await recordTurn(turn);
-      if (task === "teach" && turn.focusWords[0]) {
+      if (task === "conversation") {
+        await rememberFocusWords(turn.focusWords);
+      } else if (turn.focusWords[0]) {
         await saveItem({ arabic: turn.naturalEgyptian, english: text, kind: "phrase", priority: "HIGH" });
         showToast("Phrase saved for practice");
       }
@@ -451,7 +470,7 @@ export default function MasriApp() {
       <div className="section-kicker">COACH FEEDBACK</div>
       {feedback ? <FeedbackCard turn={feedback} onSpeak={() => void speak(feedback.naturalEgyptian)} onSave={async () => { await saveItem({ arabic: feedback.naturalEgyptian, english: feedback.meaning, kind: "phrase", priority: "HIGH" }); await refreshLearning(); showToast("Phrase saved"); }} />
         : <Panel className="coach-idle"><div className="scan-mark"><Activity /></div><strong>Speak naturally.</strong><p>MASRI will show only the correction that matters, then keep the conversation moving.</p><div className="signal-row"><span>MEANING</span><i /><span>NATURALNESS</span><i /><span>CONTEXT</span></div></Panel>}
-      <Panel className="recent-memory"><div><span className="section-kicker">ACTIVE MEMORY</span><small>{saved.length} items</small></div>{saved.slice(-4).reverse().map((item) => <div className="memory-row" key={item.id}><span className={`priority ${item.priority.toLowerCase()}`}>{item.priority}</span><ArabicText>{item.arabic}</ArabicText><span>{item.english}</span></div>)}</Panel>
+      <Panel className="recent-memory"><div><span className="section-kicker">ACTIVE MEMORY</span><small>{saved.length} items</small></div>{saved.slice(0, 4).map((item) => <div className="memory-row" key={item.id}><span className={`priority ${item.priority.toLowerCase()}`}>{item.priority}</span><ArabicText>{item.arabic}</ArabicText><span>{item.english}</span></div>)}</Panel>
     </aside>
   </div>;
 
@@ -509,7 +528,7 @@ export default function MasriApp() {
     <div className="app-content">{error && <div className="error-banner"><span>{error}</span><button onClick={() => setError("")}><X size={16} /></button></div>}{tab === "conversation" && renderConversation()}{tab === "dictionary" && renderDictionary()}{tab === "practice" && renderPractice()}{tab === "situations" && renderSituations()}{tab === "progress" && renderProgress()}</div>
     <nav className="bottom-nav" aria-label="Mobile navigation">{navItems.map(({ id, label, icon: Icon }) => <button className={tab === id ? "active" : ""} key={id} onClick={() => setTab(id)}><Icon size={20} /><span>{label}</span></button>)}</nav>
     {showDontKnow && <div className="modal-backdrop"><div className="modal small-modal"><button className="modal-close" onClick={() => setShowDontKnow(false)}><X size={19} /></button><span className="section-kicker">I DON&apos;T KNOW</span><h2>What did you want to say?</h2><p>Type it in English. MASRI will teach one natural Egyptian phrase and ask you to say it.</p><form onSubmit={async (event) => { event.preventDefault(); setShowDontKnow(false); await unlockAudio(); await processTurn(dontKnowText, "teach"); setDontKnowText(""); }}><textarea value={dontKnowText} onChange={(event) => setDontKnowText(event.target.value)} placeholder="I need to finish something first." aria-label="English phrase to learn" /><button className="primary-button" disabled={!dontKnowText.trim()}>TEACH ME <ArrowLeft size={16} /></button></form></div></div>}
-    {settingsOpen && <SettingsModal config={config} setConfig={persistConfig} close={() => setSettingsOpen(false)} connectionState={connectionState} testConnection={testConnection} clearData={async () => { if (window.confirm("Clear all learning data on this device?")) { await db().delete(); await refreshLearning(); showToast("Learning data cleared"); } }} />}
+    {settingsOpen && <SettingsModal config={config} setConfig={persistConfig} close={() => setSettingsOpen(false)} connectionState={connectionState} testConnection={testConnection} testVoice={() => void enableVoiceAndSpeak("عامل إيه؟ عملت إيه النهارده؟")} voiceError={error} clearData={async () => { if (window.confirm("Clear all learning data on this device?")) { await db().delete(); await refreshLearning(); showToast("Learning data cleared"); } }} />}
     {/* eslint-disable-next-line jsx-a11y/media-has-caption -- spoken text is rendered beside its playback control. */}
     <audio ref={audioRef} preload="auto" aria-hidden="true" />
     {toast && <div className="toast"><Check size={16} />{toast}</div>}
@@ -528,13 +547,13 @@ function FeedbackCard({ turn, onSpeak, onSave }: { turn: TutorTurn; onSpeak: () 
   </Panel>;
 }
 
-function SettingsModal({ config, setConfig, close, connectionState, testConnection, clearData }: { config: ProviderConfig; setConfig: (value: ProviderConfig) => void; close: () => void; connectionState: string; testConnection: () => void; clearData: () => void }) {
+function SettingsModal({ config, setConfig, close, connectionState, testConnection, testVoice, voiceError, clearData }: { config: ProviderConfig; setConfig: (value: ProviderConfig) => void; close: () => void; connectionState: string; testConnection: () => void; testVoice: () => void; voiceError: string; clearData: () => void }) {
   const patch = (value: Partial<ProviderConfig>) => setConfig({ ...config, ...value });
   const providerDefaults = (provider: Provider) => provider === "mistral"
-    ? { provider, textModel: "mistral-small-latest", sttModel: "voxtral-mini-latest", ttsModel: "voxtral-mini-tts-2603" }
+    ? { provider, textModel: "mistral-small-latest", sttModel: "voxtral-mini-latest" }
     : provider === "openai"
-      ? { provider, textModel: "gpt-4.1-mini", sttModel: "gpt-4o-mini-transcribe", ttsModel: "gpt-4o-mini-tts" }
-      : { provider, textModel: "", sttModel: "", ttsModel: "" };
+      ? { provider, textModel: "gpt-4.1-mini", sttModel: "gpt-4o-mini-transcribe" }
+      : { provider, textModel: "", sttModel: "" };
   return <div className="modal-backdrop"><div className="modal settings-modal"><div className="modal-title"><div><span className="section-kicker">SYSTEM CONFIGURATION</span><h2>Settings</h2></div><button className="modal-close" onClick={close}><X size={20} /></button></div>
     <div className="settings-section"><h3>AI PROVIDER</h3><div className="provider-options">{(["mistral", "openai", "custom"] as Provider[]).map((provider) => <button className={config.provider === provider ? "active" : ""} key={provider} onClick={() => patch(providerDefaults(provider))}>{provider === "mistral" ? "Mistral" : provider === "openai" ? "OpenAI" : "Custom"}<small>{provider === "mistral" ? "DEFAULT" : provider === "custom" ? "COMPATIBLE" : "OPTIONAL"}</small></button>)}</div>
       {config.provider === "custom" && <label>BASE URL<input value={config.baseUrl} onChange={(e) => patch({ baseUrl: e.target.value })} placeholder="https://provider.example/v1" /></label>}
@@ -542,7 +561,14 @@ function SettingsModal({ config, setConfig, close, connectionState, testConnecti
       <label className="toggle-line" aria-label="Remember on this device"><span><strong>Remember on this device</strong><small>Off stores the key for this browser session only.</small></span><input aria-label="Remember on this device" type="checkbox" checked={config.remember} onChange={(e) => patch({ remember: e.target.checked })} /></label>
       <button className={`test-button ${connectionState}`} onClick={testConnection} disabled={connectionState === "testing"}>{connectionState === "testing" ? "TESTING…" : connectionState === "success" ? "CONNECTED" : connectionState === "error" ? "CONNECTION FAILED" : "TEST CONNECTION"}</button>
     </div>
-    <div className="settings-section models"><h3>MODELS & VOICE</h3><label>TEXT MODEL<input value={config.textModel} onChange={(e) => patch({ textModel: e.target.value })} /></label><label>SPEECH-TO-TEXT<input value={config.sttModel} onChange={(e) => patch({ sttModel: e.target.value })} /></label><label>TEXT-TO-SPEECH<input value={config.ttsModel} onChange={(e) => patch({ ttsModel: e.target.value })} /></label><label>VOICE ID <small>(optional)</small><input value={config.voiceId} onChange={(e) => patch({ voiceId: e.target.value })} placeholder="Auto-selects an Arabic preset when blank" /></label><label>VOICE SPEED<select value={config.speed} onChange={(e) => patch({ speed: Number(e.target.value) })}><option value={0.8}>0.8×</option><option value={1}>1×</option><option value={1.15}>1.15×</option></select></label></div>
+    <div className="settings-section models"><h3>AI MODELS</h3><label>TEXT MODEL<input value={config.textModel} onChange={(e) => patch({ textModel: e.target.value })} /></label><label>SPEECH-TO-TEXT<input value={config.sttModel} onChange={(e) => patch({ sttModel: e.target.value })} /></label></div>
+    <div className="settings-section"><h3>VOICE OUTPUT</h3><div className="provider-options">{(["mistral", "elevenlabs", "browser"] as TtsProvider[]).map((provider) => <button className={config.ttsProvider === provider ? "active" : ""} key={provider} onClick={() => patch({ ttsProvider: provider })}>{provider === "mistral" ? "Mistral" : provider === "elevenlabs" ? "ElevenLabs" : "Browser fallback"}<small>{provider === "elevenlabs" ? "EGYPTIAN VOICE ID" : provider === "browser" ? "DEVICE VOICE" : "DEFAULT"}</small></button>)}</div>
+      {config.ttsProvider === "mistral" && <><label>TEXT-TO-SPEECH MODEL<input value={config.mistralTtsModel} onChange={(e) => patch({ mistralTtsModel: e.target.value })} /></label><label>VOICE ID <small>(optional)</small><input value={config.mistralVoiceId} onChange={(e) => patch({ mistralVoiceId: e.target.value })} placeholder="Auto-selects an Arabic preset when blank" /></label></>}
+      {config.ttsProvider === "elevenlabs" && <><label>ELEVENLABS API KEY<input type="password" autoComplete="off" value={config.elevenLabsApiKey} onChange={(e) => patch({ elevenLabsApiKey: e.target.value })} placeholder="Paste key — never logged" /></label><label>VOICE ID<input value={config.elevenLabsVoiceId} onChange={(e) => patch({ elevenLabsVoiceId: e.target.value })} placeholder="Paste an ElevenLabs Voice ID" /></label><label>MODEL<select value={config.elevenLabsModel} onChange={(e) => patch({ elevenLabsModel: e.target.value as ProviderConfig["elevenLabsModel"] })}><option value="eleven_multilingual_v2">eleven_multilingual_v2</option><option value="eleven_flash_v2_5">eleven_flash_v2_5</option></select></label></>}
+      <label>VOICE SPEED<select value={config.speed} onChange={(e) => patch({ speed: Number(e.target.value) })}><option value={0.8}>0.8×</option><option value={1}>1×</option><option value={1.15}>1.15×</option></select></label>
+      <button className="test-button" onClick={testVoice}>TEST VOICE</button>
+      {voiceError && <p className="settings-error" role="alert">{voiceError}</p>}
+    </div>
     <div className="settings-section"><h3>PRIVACY & COST</h3><label className="toggle-line" aria-label="Cost saver mode"><span><strong>Cost saver mode</strong><small>One combined evaluation + response call per turn.</small></span><input aria-label="Cost saver mode" type="checkbox" checked={config.costSaver} onChange={(e) => patch({ costSaver: e.target.checked })} /></label><label className="toggle-line" aria-label="Allow web search"><span><strong>Allow web search</strong><small>Off. Ordinary language coaching never needs it.</small></span><input aria-label="Allow web search" type="checkbox" checked={config.webSearch} onChange={(e) => patch({ webSearch: e.target.checked })} /></label><label className="toggle-line" aria-label="Save recordings locally"><span><strong>Save recordings locally</strong><small>Off. Audio is discarded after transcription.</small></span><input aria-label="Save recordings locally" type="checkbox" checked={config.saveRecordings} onChange={(e) => patch({ saveRecordings: e.target.checked })} /></label><button className="danger-button" onClick={clearData}><Trash2 size={15} /> CLEAR LEARNING DATA</button></div>
   </div></div>;
 }
