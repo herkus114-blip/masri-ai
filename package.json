@@ -10,7 +10,7 @@
     "build": "vinext build",
     "start": "vinext start",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/masri.test.mjs tests/speech-route.test.ts tests/learning-memory.test.ts tests/conversation-speed.test.ts",
+    "test": "tsx --test tests/masri.test.mjs tests/speech-route.test.ts tests/learning-memory.test.ts tests/conversation-speed.test.ts tests/dictionary-egyptian.test.ts",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },

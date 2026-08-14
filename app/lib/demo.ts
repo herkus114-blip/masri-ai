@@ -29,6 +29,18 @@ export function demoTutorTurn(input: string): TutorTurn {
 }
 
 const dictionary: Record<string, DictionaryResult> = {
+  umbrella: {
+    arabic: "شمسية",
+    english: "umbrella",
+    forms: ["شمسية / شمسيات"],
+    examples: [
+      { arabic: "خد الشمسيّة عشان الدنيا هتمطر.", english: "Take the umbrella because it is going to rain." },
+      { arabic: "نسيت الشمسيّة في العربية.", english: "I forgot the umbrella in the car." },
+    ],
+    alternatives: [],
+    priority: "CORE",
+    confidence: "HIGH",
+  },
   busy: {
     arabic: "مشغول",
     english: "busy",
@@ -40,6 +52,7 @@ const dictionary: Record<string, DictionaryResult> = {
     ],
     alternatives: [],
     priority: "CORE",
+    confidence: "HIGH",
   },
   "i was going to call you but i forgot": {
     arabic: "كنت هكلمك بس نسيت.",
@@ -51,6 +64,7 @@ const dictionary: Record<string, DictionaryResult> = {
     ],
     alternatives: ["كنت ناوي أكلمك بس نسيت."],
     priority: "HIGH",
+    confidence: "HIGH",
   },
 };
 
@@ -67,6 +81,7 @@ export function demoDictionary(query: string): DictionaryResult {
     ],
     alternatives: ["ممكن توضّح؟"],
     priority: "CORE",
+    confidence: "LOW",
   };
 }
 

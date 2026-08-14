@@ -10,6 +10,20 @@ test("central tutor prompt enforces spoken Egyptian", async () => {
   assert.match(prompt, /not Modern Standard Arabic/i);
   assert.match(prompt, /Do not penalize normal colloquial spelling/i);
   assert.match(prompt, /Return only valid JSON/i);
+  assert.match(prompt, /umbrella is شمسية, not مظلة/i);
+  assert.match(prompt, /Never invent a supposedly colloquial word/i);
+  assert.match(prompt, /lower the confidence/i);
+});
+
+test("Dictionary and Practice prefer everyday Egyptian over formal MSA", async () => {
+  const prompt = await readFile(new URL("app/lib/systemPrompt.ts", root), "utf8");
+  const route = await readFile(new URL("app/api/ai/route.ts", root), "utf8");
+  const app = await readFile(new URL("app/components/MasriApp.tsx", root), "utf8");
+  assert.match(prompt, /"confidence": "HIGH\|MEDIUM\|LOW"/);
+  assert.match(route, /prefer the everyday Egyptian word over an MSA dictionary equivalent/);
+  assert.match(route, /task === "dictionary" \? 0\.2/);
+  assert.match(app, /Formal MSA dictionary equivalents are not substituted/);
+  assert.match(app, /currentPractice\.arabic/);
 });
 
 test("voice loop includes record, transcription, evaluation and speech", async () => {

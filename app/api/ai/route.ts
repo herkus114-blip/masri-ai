@@ -43,8 +43,8 @@ export async function POST(request: Request) {
     if (task === "conversation") {
       userPrompt = `Conversation mode: ${input.mode}\nLearner said: ${input.text}\nRecent high-value words: ${input.recentWords.join(", ") || "none"}\nRecurring mistakes to target: ${input.recurringMistakes.join(", ") || "none"}\nEvaluate and continue. JSON shape:\n${tutorJsonShape}`;
     } else if (task === "dictionary") {
-      system = `${MASRI_SYSTEM_PROMPT}\nAct as an English to Egyptian Arabic phrase finder. Give the single most natural, useful spoken result. Keep it compact.`;
-      userPrompt = `Find how a normal Egyptian would say: ${input.text}\nJSON shape:\n${dictionaryJsonShape}`;
+      system = `${MASRI_SYSTEM_PROMPT}\nAct as an English to Egyptian Arabic phrase finder. Give the single most natural, useful spoken result. For a word lookup, explicitly prefer the everyday Egyptian word over an MSA dictionary equivalent. Set confidence HIGH only when the form is genuinely common in ordinary Egyptian speech; otherwise use MEDIUM or LOW instead of inventing or falling back to formal Arabic. Keep it compact.`;
+      userPrompt = `Find how a normal Egyptian would actually say in everyday conversation: ${input.text}\nJSON shape:\n${dictionaryJsonShape}`;
     } else if (task === "teach") {
       userPrompt = `The learner does not know how to say this in Egyptian Arabic: ${input.text}\nTeach the shortest natural high-value version, then ask them to repeat it. Treat their English as the transcript. JSON shape:\n${tutorJsonShape}`;
     } else {
@@ -57,7 +57,7 @@ export async function POST(request: Request) {
       headers: { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model: config.textModel,
-        temperature: task === "test" ? 0 : 0.35,
+        temperature: task === "test" ? 0 : task === "dictionary" ? 0.2 : 0.35,
         max_tokens: task === "test" ? 12 : 900,
         response_format: task === "test" ? undefined : { type: "json_object" },
         messages: [

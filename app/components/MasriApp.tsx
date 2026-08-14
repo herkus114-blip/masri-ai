@@ -452,7 +452,7 @@ export default function MasriApp() {
     setDictionaryLoading(true); setError("");
     try {
       const cached = await db().dictionary.get(dictionaryQuery.toLowerCase());
-      if (cached && cached.mode === dictionaryMode) { setDictionaryResult(cached.result); setDictionaryLoading(false); return; }
+      if (cached && cached.mode === dictionaryMode) { setDictionaryResult(DictionaryResultSchema.parse(cached.result)); setDictionaryLoading(false); return; }
       let result: DictionaryResult;
       if (config.apiKey) {
         const data = await postJson<{ result: unknown }>("/api/ai", aiPayload("dictionary", dictionaryQuery));
@@ -548,14 +548,14 @@ export default function MasriApp() {
       <div className="quick-searches"><span>TRY</span>{["busy", "I forgot", "Are you free tomorrow?"].map((item) => <button key={item} onClick={() => setDictionaryQuery(item)}>{item}</button>)}</div>
     </Panel>
     {dictionaryResult ? <Panel className="dictionary-result">
-      <div className="result-head"><div><span className={`priority ${dictionaryResult.priority.toLowerCase()}`}>{dictionaryResult.priority}</span><ArabicText className="dictionary-arabic">{dictionaryResult.arabic}</ArabicText><p>{dictionaryResult.english}</p>{dictionaryResult.forms.map((form) => <ArabicText className="form-chip" key={form}>{form}</ArabicText>)}</div><button className="play-square" onClick={() => void speak(dictionaryResult.arabic)}><Play size={21} fill="currentColor" /></button></div>
+      <div className="result-head"><div><div className="dictionary-signals"><span className={`priority ${dictionaryResult.priority.toLowerCase()}`}>{dictionaryResult.priority}</span><span className={`confidence ${dictionaryResult.confidence.toLowerCase()}`}>{dictionaryResult.confidence} CONFIDENCE</span></div><ArabicText className="dictionary-arabic">{dictionaryResult.arabic}</ArabicText><p>{dictionaryResult.english}</p>{dictionaryResult.forms.map((form) => <ArabicText className="form-chip" key={form}>{form}</ArabicText>)}</div><button className="play-square" onClick={() => void speak(dictionaryResult.arabic)}><Play size={21} fill="currentColor" /></button></div>
       <div className="example-list"><span className="section-kicker">IN REAL LIFE</span>{dictionaryResult.examples.map((example, i) => <div key={i}><ArabicText>{example.arabic}</ArabicText><p>{example.english}</p><button onClick={() => void speak(example.arabic)} aria-label="Play example"><Volume2 size={16} /></button></div>)}</div>
       <div className="result-actions"><button onClick={() => void saveDictionaryResult()}><Star size={16} /> SAVE</button><button onClick={() => { setTab("practice"); void saveDictionaryResult(); }}><Mic size={16} /> PRACTICE</button><button onClick={() => { void navigator.clipboard.writeText(dictionaryResult.arabic); showToast("Copied"); }}><Copy size={16} /> COPY</button></div>
     </Panel> : <EmptyState icon={Search} title="Ask for a word or a whole thought" copy="Results are cached on this device to save credits." />}
   </div>;
 
   const renderPractice = () => <div className="content-narrow">
-    <div className="page-heading"><div><span className="section-kicker">ADAPTIVE REVIEW</span><h1>Make useful language automatic.</h1><p>Today&apos;s queue favors high-frequency language and your recurring mistakes.</p></div><div className="due-badge"><strong>{dueItems.length}</strong><span>DUE NOW</span></div></div>
+    <div className="page-heading"><div><span className="section-kicker">ADAPTIVE REVIEW</span><h1>Make useful language automatic.</h1><p>Review the everyday Egyptian forms you saved. Formal MSA dictionary equivalents are not substituted.</p></div><div className="due-badge"><strong>{dueItems.length}</strong><span>DUE NOW</span></div></div>
     {currentPractice ? <Panel className="practice-card">
       <div className="practice-top"><span>ENGLISH → ARABIC</span><span>{(practiceIndex % practiceItems.length) + 1} / {practiceItems.length}</span></div>
       <div className="practice-prompt"><p>How would you say:</p><h2>{currentPractice.english}</h2>{practiceRevealed ? <div className="practice-answer"><ArabicText>{currentPractice.arabic}</ArabicText><button onClick={() => void speak(currentPractice.arabic)}><Volume2 size={18} /></button></div> : <button className="reveal" onClick={() => setPracticeRevealed(true)}>REVEAL EGYPTIAN</button>}</div>

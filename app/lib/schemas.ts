@@ -35,6 +35,7 @@ export const DictionaryResultSchema = z.object({
   ).min(1).max(3),
   alternatives: z.array(z.string()).max(2).default([]),
   priority: z.enum(["CORE", "HIGH", "MEDIUM", "LOW"]),
+  confidence: z.enum(["HIGH", "MEDIUM", "LOW"]).default("MEDIUM"),
 });
 
 export type TutorTurn = z.infer<typeof TutorTurnSchema>;
