@@ -70,6 +70,30 @@ test("voice output provider is independent and includes ElevenLabs", async () =>
   assert.match(app, /عامل إيه؟ عملت إيه النهارده؟/);
 });
 
+test("Conversation speech speed is isolated, pitch-preserving, and replay-cache aware", async () => {
+  const app = await readFile(new URL("app/components/MasriApp.tsx", root), "utf8");
+  assert.match(app, /CONVERSATION_SPEED_STORAGE_KEY/);
+  assert.match(app, /conversationAudioCacheRef/);
+  assert.match(app, /cachedAudio/);
+  assert.match(app, /audio\.playbackRate = playbackRate/);
+  assert.match(app, /audio\.preservesPitch = true/);
+  assert.match(app, /enableVoiceAndSpeak\(prompt\.arabic, "conversation"\)/);
+  assert.match(app, /speak\(turn\.replyArabic, "conversation"\)/);
+
+  const requestStart = app.indexOf('const response = await fetch("/api/speech"');
+  const requestEnd = app.indexOf("});", requestStart);
+  assert.ok(requestStart >= 0 && requestEnd > requestStart);
+  assert.doesNotMatch(app.slice(requestStart, requestEnd), /speed|playbackRate/);
+});
+
+test("Practice and Dictionary keep the standard pronunciation path", async () => {
+  const app = await readFile(new URL("app/components/MasriApp.tsx", root), "utf8");
+  assert.match(app, /speak\(currentPractice\.arabic\)/);
+  assert.doesNotMatch(app, /speak\(currentPractice\.arabic, "conversation"\)/);
+  assert.match(app, /speak\(dictionaryResult\.arabic\)/);
+  assert.doesNotMatch(app, /speak\(dictionaryResult\.arabic, "conversation"\)/);
+});
+
 test("API keys are never hardcoded", async () => {
   const config = await readFile(new URL("app/components/MasriApp.tsx", root), "utf8");
   const env = await readFile(new URL(".env.example", root), "utf8");

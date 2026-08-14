@@ -9,6 +9,7 @@ import {
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DictionaryResultSchema, TutorTurnSchema, type DictionaryResult, type TutorTurn } from "../lib/schemas";
 import { demoDictionary, demoTeach, demoTutorTurn } from "../lib/demo";
+import { CONVERSATION_SPEEDS, CONVERSATION_SPEED_STORAGE_KEY, DEFAULT_CONVERSATION_SPEED, parseConversationSpeed, stepConversationSpeed, type ConversationSpeed } from "../lib/conversationSpeech";
 import { db, exportLearningData, recordTurn, rememberFocusWords, reviewItem, saveItem, sortSavedByRecent, type SavedItem } from "../lib/storage";
 
 type Tab = "conversation" | "dictionary" | "practice" | "situations" | "progress";
@@ -17,7 +18,7 @@ type Provider = "mistral" | "openai" | "custom";
 type TtsProvider = "mistral" | "elevenlabs" | "browser";
 
 interface TtsDiagnostic {
-  label: "TTS REQUEST STARTED" | "HTTP STATUS" | "AUDIO RECEIVED" | "AUDIO BYTE SIZE" | "PLAYBACK STARTED" | "PLAYBACK ENDED" | "PLAYBACK ERROR";
+  label: "TTS REQUEST STARTED" | "HTTP STATUS" | "AUDIO RECEIVED" | "AUDIO BYTE SIZE" | "AUDIO CACHE HIT" | "PLAYBACK STARTED" | "PLAYBACK ENDED" | "PLAYBACK ERROR";
   detail?: string;
   error?: boolean;
 }
@@ -39,6 +40,13 @@ interface ProviderConfig {
   costSaver: boolean;
   webSearch: boolean;
   saveRecordings: boolean;
+}
+
+interface ConversationAudioCache {
+  cacheKey: string;
+  objectUrl: string;
+  mimeType: string;
+  byteSize: number;
 }
 
 const defaultConfig: ProviderConfig = {
@@ -110,6 +118,7 @@ export default function MasriApp() {
   const [micLevel, setMicLevel] = useState(0.25);
   const [audioUnlocked, setAudioUnlocked] = useState(false);
   const [ttsDiagnostics, setTtsDiagnostics] = useState<TtsDiagnostic[]>([]);
+  const [conversationSpeed, setConversationSpeed] = useState<ConversationSpeed>(DEFAULT_CONVERSATION_SPEED);
 
   const mediaRecorder = useRef<MediaRecorder | null>(null);
   const chunks = useRef<Blob[]>([]);
@@ -120,6 +129,7 @@ export default function MasriApp() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioUnlockedRef = useRef(false);
   const audioUrlRef = useRef<string | null>(null);
+  const conversationAudioCacheRef = useRef<ConversationAudioCache | null>(null);
   const historyRef = useRef(history);
   const [reviewClock] = useState(() => Date.now());
 
@@ -154,6 +164,17 @@ export default function MasriApp() {
   }, [refreshLearning]);
 
   useEffect(() => {
+    const storedSpeed = parseConversationSpeed(window.localStorage.getItem(CONVERSATION_SPEED_STORAGE_KEY));
+    queueMicrotask(() => setConversationSpeed(storedSpeed));
+  }, []);
+
+  useEffect(() => () => {
+    const cachedUrl = conversationAudioCacheRef.current?.objectUrl;
+    if (audioUrlRef.current && audioUrlRef.current !== cachedUrl) URL.revokeObjectURL(audioUrlRef.current);
+    if (cachedUrl) URL.revokeObjectURL(cachedUrl);
+  }, []);
+
+  useEffect(() => {
     historyRef.current = history;
   }, [history]);
 
@@ -167,6 +188,14 @@ export default function MasriApp() {
       sessionStorage.setItem("masri-provider-config", serialized);
       localStorage.removeItem("masri-provider-config");
     }
+  };
+
+  const changeConversationSpeed = (direction: -1 | 1) => {
+    setConversationSpeed((current) => {
+      const next = stepConversationSpeed(current, direction);
+      window.localStorage.setItem(CONVERSATION_SPEED_STORAGE_KEY, String(next));
+      return next;
+    });
   };
 
   const reportTts = useCallback((entry: TtsDiagnostic) => {
@@ -198,30 +227,32 @@ export default function MasriApp() {
     }
   }, [reportTts]);
 
-  const browserSpeak = useCallback((text: string) => new Promise<void>((resolve, reject) => {
+  const browserSpeak = useCallback((text: string, playbackRate: number) => new Promise<void>((resolve, reject) => {
     if (!("speechSynthesis" in window)) { reject(new Error("Browser speech synthesis is unavailable.")); return; }
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = "ar-EG";
-    utterance.rate = config.speed;
+    utterance.rate = playbackRate;
     const voice = window.speechSynthesis.getVoices().find((item) => item.lang.toLowerCase().startsWith("ar"));
     if (voice) utterance.voice = voice;
     utterance.onstart = () => { setVoiceState("speaking"); reportTts({ label: "PLAYBACK STARTED", detail: "browser Arabic voice" }); };
     utterance.onend = () => { reportTts({ label: "PLAYBACK ENDED" }); resolve(); };
     utterance.onerror = (event) => reject(new Error(`Browser speech failed: ${event.error}`));
     window.speechSynthesis.speak(utterance);
-  }), [config.speed, reportTts]);
+  }), [reportTts]);
 
-  const speak = useCallback(async (text: string) => {
+  const speak = useCallback(async (text: string, context: "standard" | "conversation" = "standard") => {
     setError("");
     setTtsDiagnostics([]);
     setVoiceState("thinking");
     setThinkingStatus("GENERATING VOICE");
-    reportTts({ label: "TTS REQUEST STARTED", detail: text });
     try {
       if (!audioUnlockedRef.current) throw new Error("Tap the Voice Core or speaker once to enable audio.");
+      const isConversation = context === "conversation";
+      const playbackRate = isConversation ? conversationSpeed : config.speed;
       if (config.ttsProvider === "browser" || (config.ttsProvider === "mistral" && !config.apiKey)) {
-        await browserSpeak(text);
+        reportTts({ label: "TTS REQUEST STARTED", detail: text });
+        await browserSpeak(text, playbackRate);
         return;
       }
 
@@ -232,36 +263,65 @@ export default function MasriApp() {
       if (!apiKey) throw new Error(`${isElevenLabs ? "ElevenLabs" : "Mistral"} API key is missing.`);
       if (isElevenLabs && !voice.trim()) throw new Error("ElevenLabs Voice ID is missing.");
 
-      const response = await fetch("/api/speech", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text, provider: config.ttsProvider, apiKey, model, voice,
-        }),
-      });
-      reportTts({ label: "HTTP STATUS", detail: String(response.status), error: !response.ok });
-      if (!response.ok) {
-        const problem = await response.json().catch(() => ({ error: "TTS request failed." })) as { error?: string };
-        throw new Error(problem.error || `TTS request failed with HTTP ${response.status}.`);
-      }
+      const conversationCacheKey = JSON.stringify([text, config.ttsProvider, model, voice]);
+      const cachedAudio = isConversation && conversationAudioCacheRef.current?.cacheKey === conversationCacheKey
+        ? conversationAudioCacheRef.current
+        : null;
+      let objectUrl = cachedAudio?.objectUrl ?? "";
+      let mimeType = cachedAudio?.mimeType ?? "";
+      let byteSize = cachedAudio?.byteSize ?? 0;
+      let replacedCacheUrl: string | null = null;
 
-      const mimeType = response.headers.get("content-type") || "";
-      const blob = await response.blob();
-      reportTts({ label: "AUDIO RECEIVED", detail: mimeType || "unknown MIME type" });
-      reportTts({ label: "AUDIO BYTE SIZE", detail: String(blob.size), error: blob.size < 128 });
-      if (!mimeType.startsWith("audio/") || blob.size < 128) {
-        throw new Error(`Invalid TTS audio response (${mimeType || "no MIME type"}, ${blob.size} bytes).`);
+      if (cachedAudio) {
+        reportTts({ label: "AUDIO CACHE HIT", detail: `${mimeType}, ${byteSize} bytes` });
+      } else {
+        reportTts({ label: "TTS REQUEST STARTED", detail: text });
+        const response = await fetch("/api/speech", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text, provider: config.ttsProvider, apiKey, model, voice,
+          }),
+        });
+        reportTts({ label: "HTTP STATUS", detail: String(response.status), error: !response.ok });
+        if (!response.ok) {
+          const problem = await response.json().catch(() => ({ error: "TTS request failed." })) as { error?: string };
+          throw new Error(problem.error || `TTS request failed with HTTP ${response.status}.`);
+        }
+
+        mimeType = response.headers.get("content-type") || "";
+        const blob = await response.blob();
+        byteSize = blob.size;
+        reportTts({ label: "AUDIO RECEIVED", detail: mimeType || "unknown MIME type" });
+        reportTts({ label: "AUDIO BYTE SIZE", detail: String(byteSize), error: byteSize < 128 });
+        if (!mimeType.startsWith("audio/") || byteSize < 128) {
+          throw new Error(`Invalid TTS audio response (${mimeType || "no MIME type"}, ${byteSize} bytes).`);
+        }
+        objectUrl = URL.createObjectURL(blob);
+        if (isConversation) {
+          replacedCacheUrl = conversationAudioCacheRef.current?.objectUrl ?? null;
+          conversationAudioCacheRef.current = { cacheKey: conversationCacheKey, objectUrl, mimeType, byteSize };
+        }
       }
 
       const audio = audioRef.current;
       if (!audio) throw new Error("The browser audio element is unavailable.");
-      if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
-      const objectUrl = URL.createObjectURL(blob);
+      const previousLoadedUrl = audioUrlRef.current;
+      audio.pause();
       audioUrlRef.current = objectUrl;
       audio.src = objectUrl;
-      audio.playbackRate = config.speed;
+      audio.playbackRate = playbackRate;
+      if ("preservesPitch" in audio) audio.preservesPitch = true;
+      const vendorAudio = audio as HTMLAudioElement & { webkitPreservesPitch?: boolean };
+      if ("webkitPreservesPitch" in vendorAudio) vendorAudio.webkitPreservesPitch = true;
       audio.volume = 1;
       audio.load();
+      const currentCachedUrl = conversationAudioCacheRef.current?.objectUrl;
+      const urlsToRevoke = new Set([previousLoadedUrl, replacedCacheUrl]);
+      urlsToRevoke.delete(null);
+      urlsToRevoke.delete(objectUrl);
+      urlsToRevoke.delete(currentCachedUrl ?? null);
+      urlsToRevoke.forEach((url) => URL.revokeObjectURL(url as string));
 
       const ended = new Promise<void>((resolve, reject) => {
         audio.onended = () => { reportTts({ label: "PLAYBACK ENDED" }); resolve(); };
@@ -269,7 +329,7 @@ export default function MasriApp() {
       });
       await audio.play();
       setVoiceState("speaking");
-      reportTts({ label: "PLAYBACK STARTED", detail: `${mimeType}, ${blob.size} bytes` });
+      reportTts({ label: "PLAYBACK STARTED", detail: `${mimeType}, ${byteSize} bytes at ${playbackRate.toFixed(1)}×` });
       await ended;
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "Audio playback failed.";
@@ -278,10 +338,10 @@ export default function MasriApp() {
     } finally {
       setVoiceState("ready");
     }
-  }, [browserSpeak, config, reportTts]);
+  }, [browserSpeak, config, conversationSpeed, reportTts]);
 
-  const enableVoiceAndSpeak = useCallback(async (text: string) => {
-    if (await unlockAudio()) await speak(text);
+  const enableVoiceAndSpeak = useCallback(async (text: string, context: "standard" | "conversation" = "standard") => {
+    if (await unlockAudio()) await speak(text, context);
   }, [speak, unlockAudio]);
 
   const aiPayload = useCallback((task: "conversation" | "dictionary" | "teach" | "test", text: string) => ({
@@ -316,7 +376,7 @@ export default function MasriApp() {
         showToast("Phrase saved for practice");
       }
       await refreshLearning();
-      await speak(turn.replyArabic);
+      await speak(turn.replyArabic, "conversation");
     } catch (cause) {
       setVoiceState("ready");
       setError(cause instanceof Error ? cause.message : "MASRI could not process that turn.");
@@ -441,7 +501,7 @@ export default function MasriApp() {
       <Panel className="voice-stage">
         <div className="stage-grid" aria-hidden="true" />
         <div className="live-context"><span className="pulse-dot" /> LIVE CONTEXT <span>{customTopic || mode.toUpperCase()}</span></div>
-        <button className={`voice-core ${voiceState}`} onClick={voiceState === "listening" ? stopRecording : voiceState === "ready" ? audioUnlocked ? startRecording : () => void enableVoiceAndSpeak(prompt.arabic) : undefined} aria-label={voiceState === "listening" ? "Stop recording" : audioUnlocked ? "Start speaking" : "Enable voice and hear MASRI"} style={{ "--mic-level": micLevel } as React.CSSProperties}>
+        <button className={`voice-core ${voiceState}`} onClick={voiceState === "listening" ? stopRecording : voiceState === "ready" ? audioUnlocked ? startRecording : () => void enableVoiceAndSpeak(prompt.arabic, "conversation") : undefined} aria-label={voiceState === "listening" ? "Stop recording" : audioUnlocked ? "Start speaking" : "Enable voice and hear MASRI"} style={{ "--mic-level": micLevel } as React.CSSProperties}>
           <span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="core-halo" />
           <span className="core-inner">
             {voiceState === "listening" ? <MicOff size={30} /> : voiceState === "thinking" ? <Activity size={30} /> : voiceState === "speaking" ? <Volume2 size={30} /> : <Mic size={30} />}
@@ -452,8 +512,14 @@ export default function MasriApp() {
         <div className={`wave-strip ${voiceState}`} aria-hidden="true">{Array.from({ length: 21 }, (_, i) => <i key={i} style={{ animationDelay: `${i * -0.06}s` }} />)}</div>
         <div className="prompt-block">
           <ArabicText className="prompt-arabic">{prompt.arabic}</ArabicText>
-          <button className="icon-button small" onClick={() => void enableVoiceAndSpeak(prompt.arabic)} aria-label="Play MASRI prompt"><Volume2 size={17} /></button>
+          <button className="icon-button small" onClick={() => void enableVoiceAndSpeak(prompt.arabic, "conversation")} aria-label="Play MASRI prompt"><Volume2 size={17} /></button>
           <p>{prompt.english}</p>
+          <div className="conversation-speed" role="group" aria-label="Conversation speech speed">
+            <span>SPEECH SPEED</span>
+            <button type="button" onClick={() => changeConversationSpeed(-1)} disabled={conversationSpeed === CONVERSATION_SPEEDS[0]} aria-label="Decrease conversation speech speed">−</button>
+            <output aria-live="polite" aria-label="Current conversation speech speed">{conversationSpeed.toFixed(1)}×</output>
+            <button type="button" onClick={() => changeConversationSpeed(1)} disabled={conversationSpeed === CONVERSATION_SPEEDS[CONVERSATION_SPEEDS.length - 1]} aria-label="Increase conversation speech speed">+</button>
+          </div>
         </div>
         <div className="conversation-actions">
           <button className="outline-action" onClick={() => setShowDontKnow(true)}><Sparkles size={16} /> I DON&apos;T KNOW</button>
@@ -468,7 +534,7 @@ export default function MasriApp() {
     </div>
     <aside className="coach-column">
       <div className="section-kicker">COACH FEEDBACK</div>
-      {feedback ? <FeedbackCard turn={feedback} onSpeak={() => void speak(feedback.naturalEgyptian)} onSave={async () => { await saveItem({ arabic: feedback.naturalEgyptian, english: feedback.meaning, kind: "phrase", priority: "HIGH" }); await refreshLearning(); showToast("Phrase saved"); }} />
+      {feedback ? <FeedbackCard turn={feedback} onSpeak={() => void speak(feedback.naturalEgyptian, "conversation")} onSave={async () => { await saveItem({ arabic: feedback.naturalEgyptian, english: feedback.meaning, kind: "phrase", priority: "HIGH" }); await refreshLearning(); showToast("Phrase saved"); }} />
         : <Panel className="coach-idle"><div className="scan-mark"><Activity /></div><strong>Speak naturally.</strong><p>MASRI will show only the correction that matters, then keep the conversation moving.</p><div className="signal-row"><span>MEANING</span><i /><span>NATURALNESS</span><i /><span>CONTEXT</span></div></Panel>}
       <Panel className="recent-memory"><div><span className="section-kicker">ACTIVE MEMORY</span><small>{saved.length} items</small></div>{saved.slice(0, 4).map((item) => <div className="memory-row" key={item.id}><span className={`priority ${item.priority.toLowerCase()}`}>{item.priority}</span><ArabicText>{item.arabic}</ArabicText><span>{item.english}</span></div>)}</Panel>
     </aside>
@@ -510,7 +576,7 @@ export default function MasriApp() {
   ];
 
   // eslint-disable-next-line react-hooks/refs -- voice playback runs only from the click handler.
-  const renderSituations = () => <div className="content-wide"><div className="page-heading"><div><span className="section-kicker">ROLEPLAY</span><h1>Rehearse life before it happens.</h1><p>MASRI plays the other person. You respond out loud in Egyptian.</p></div></div><div className="situation-grid">{situations.map(({ title, arabic, icon: Icon, level }) => <button key={title} className="situation-card" onClick={() => { setPrompt({ arabic, english: title }); setMode(title); setTab("conversation"); window.setTimeout(() => void speak(arabic), 100); }}><span className="situation-icon"><Icon size={22} /></span><span className={`priority ${level.toLowerCase()}`}>{level}</span><strong>{title}</strong><ArabicText>{arabic}</ArabicText><span className="begin">BEGIN ROLEPLAY <ChevronRight size={16} /></span></button>)}</div></div>;
+  const renderSituations = () => <div className="content-wide"><div className="page-heading"><div><span className="section-kicker">ROLEPLAY</span><h1>Rehearse life before it happens.</h1><p>MASRI plays the other person. You respond out loud in Egyptian.</p></div></div><div className="situation-grid">{situations.map(({ title, arabic, icon: Icon, level }) => <button key={title} className="situation-card" onClick={() => { setPrompt({ arabic, english: title }); setMode(title); setTab("conversation"); window.setTimeout(() => void speak(arabic, "conversation"), 100); }}><span className="situation-icon"><Icon size={22} /></span><span className={`priority ${level.toLowerCase()}`}>{level}</span><strong>{title}</strong><ArabicText>{arabic}</ArabicText><span className="begin">BEGIN ROLEPLAY <ChevronRight size={16} /></span></button>)}</div></div>;
 
   const renderProgress = () => <div className="content-wide">
     <div className="page-heading"><div><span className="section-kicker">LEARNING SIGNAL</span><h1>Your Egyptian, in motion.</h1><p>Useful evidence—not trophies.</p></div><div className="streak"><Activity size={18} /><strong>{conversations.length ? 1 : 0}</strong><span>DAY STREAK</span></div></div>
